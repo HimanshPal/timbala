@@ -8,11 +8,13 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/golang/snappy"
 	"github.com/mattbostock/timbala/internal/cluster"
 	"github.com/mattbostock/timbala/internal/read"
+	"github.com/mattbostock/timbala/internal/write"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage"
@@ -74,7 +76,27 @@ func (f *fanoutStorage) Querier(ctx context.Context, mint int64, maxt int64) (st
 }
 
 func (f *fanoutStorage) Appender() (storage.Appender, error) {
-	panic("not implemented")
+	var (
+		clients   = f.remoteClients()
+		appenders []storage.Appender
+	)
+
+	localAppender, err := f.localStore.Appender()
+	if err != nil {
+		return nil, err
+	}
+
+	appenders = append(appenders, localAppender)
+
+	for _, c := range clients {
+		appenders = append(appenders, &fanoutAppender{
+			ctx:     ctx,
+			client:  c,
+			storage: f,
+		})
+	}
+
+	return storage.NewMergeAppender(appenders), nil
 }
 
 func (f *fanoutStorage) StartTime() (int64, error) {
@@ -148,6 +170,50 @@ func (_ fanoutQuerier) Close() error {
 	return nil
 }
 
+type fanoutAppender struct {
+	sync.Mutex
+
+	ctx     context.Context
+	client  *remoteClient
+	storage *fanoutStorage
+	ts      []*prompb.TimeSeries
+}
+
+func (a *fanoutAppender) Add(l labels.Labels, t int64, v float64) (uint64, error) {
+	a.Lock()
+	defer a.Unlock()
+
+	err := a.AddFast(l, ref, t, v)
+	if err != nil {
+		return 0, nil
+	}
+
+	return ref, nil
+}
+
+func (a *fanoutAppender) AddFast(l labels.Labels, ref uint64, t int64, v float64) error {
+	a.Lock()
+	defer a.Unlock()
+
+	panic("not implemented")
+}
+
+func (a *fanoutAppender) Commit() error {
+	a.Lock()
+	defer a.Unlock()
+
+	// send request
+	panic("not implemented")
+}
+
+func (a *fanoutAppender) Rollback() error {
+	a.Lock()
+	defer a.Unlock()
+
+	// wipe data
+	panic("not implemented")
+}
+
 type remoteClient struct{ httpURL string }
 
 func (c *remoteClient) Read(ctx context.Context, from, through int64, matchers []*prompb.LabelMatcher) ([]*prompb.TimeSeries, error) {
@@ -209,6 +275,40 @@ func (c *remoteClient) Read(ctx context.Context, from, through int64, matchers [
 	}
 
 	return resp.Results[0].Timeseries, nil
+}
+
+func (c *remoteClient) Write(ctx context.Context, series []*prompb.TimeSeries) error {
+	req := &prompb.WriteRequest{
+		Timeseries: series,
+	}
+
+	data, err := req.Marshal()
+	if err != nil {
+		return err
+	}
+
+	compressed := snappy.Encode(nil, data)
+	nodeReq, err := http.NewRequest("POST", c.httpURL+write.Route, bytes.NewBuffer(compressed))
+	if err != nil {
+		return err
+	}
+	nodeReq.Header.Add("Content-Encoding", "snappy")
+	nodeReq.Header.Set("Content-Type", "application/x-protobuf")
+	nodeReq.Header.Set(write.HTTPHeaderRemoteWrite, write.HTTPHeaderRemoteWriteVersion)
+	nodeReq.Header.Set(write.HTTPHeaderInternalWrite, write.HTTPHeaderInternalWriteVersion)
+
+	httpResp, err := ctxhttp.Do(ctx, http.DefaultClient, nodeReq)
+	if err != nil {
+		return nil
+	}
+
+	httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("got HTTP %d status code", httpResp.StatusCode)
+	}
+
+	return nil
 }
 
 func labelPairsToLabels(labelPairs []*prompb.Label) labels.Labels {

@@ -1,11 +1,7 @@
 package write
 
 import (
-	"bytes"
-	"context"
 	"errors"
-	"fmt"
-	"io"
 	"io/ioutil"
 	"net/http"
 	"sort"
@@ -18,18 +14,17 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/net/context/ctxhttp"
 )
 
 const (
 	HTTPHeaderInternalWrite        = "X-Timbala-Internal-Write-Version"
 	HTTPHeaderInternalWriteVersion = "0.0.1"
 	HTTPHeaderPartitionKeySalt     = "X-Timbala-Partition-Key-Salt"
+	HTTPHeaderRemoteWrite          = "X-Prometheus-Remote-Write-Version"
+	HTTPHeaderRemoteWriteVersion   = "0.1.0"
 	Route                          = "/write"
 
-	httpHeaderRemoteWrite        = "X-Prometheus-Remote-Write-Version"
-	httpHeaderRemoteWriteVersion = "0.1.0"
-	numPreallocTimeseries        = 1e5
+	numPreallocTimeseries = 1e5
 )
 
 type Writer interface {
@@ -80,9 +75,10 @@ func (wr *writer) HandlerFunc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	internal := len(r.Header.Get(HTTPHeaderInternalWrite)) > 0
 	// This is an internal write, so don't replicate it to other nodes
 	// This case is very common, to make it fast
-	if r.Header.Get(HTTPHeaderInternalWrite) != "" {
+	if internal {
 		wr.mu.Lock()
 		appender, err := wr.localStore.Appender()
 		if err != nil {
@@ -150,6 +146,30 @@ func (wr *writer) HandlerFunc(w http.ResponseWriter, r *http.Request) {
 		// FIXME: sort samples by time?
 	}
 
+	// FIXME locking?
+	appender, err := wr.fanoutStore.Appender()
+	if err != nil {
+		wr.mu.Unlock()
+		return err
+	}
+	for _, sseries := range series {
+		m := make(labels.Labels, 0, len(sseries.Labels))
+		for _, l := range sseries.Labels {
+			m = append(m, labels.Label{
+				Name:  l.Name,
+				Value: l.Value,
+			})
+		}
+		sort.Stable(m)
+
+		for _, s := range sseries.Samples {
+			// FIXME: Look at using AddFast
+			appender.Add(m, s.Timestamp, s.Value)
+		}
+	}
+	// Intentionally avoid defer on hot path
+	appender.Commit()
+
 	localSeries, ok := seriesToNodes[*wr.clstr.LocalNode()]
 	if ok {
 		err = wr.localWrite(localSeries)
@@ -169,108 +189,6 @@ func (wr *writer) HandlerFunc(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-}
-
-func (wr *writer) localWrite(series seriesMap) error {
-	wr.mu.Lock()
-	appender, err := wr.localStore.Appender()
-	if err != nil {
-		wr.mu.Unlock()
-		return err
-	}
-
-	for _, sseries := range series {
-		m := make(labels.Labels, 0, len(sseries.Labels))
-		for _, l := range sseries.Labels {
-			m = append(m, labels.Label{
-				Name:  l.Name,
-				Value: l.Value,
-			})
-		}
-		sort.Stable(m)
-
-		for _, s := range sseries.Samples {
-			// FIXME: Look at using AddFast
-			appender.Add(m, s.Timestamp, s.Value)
-		}
-	}
-	// Intentionally avoid defer on hot path
-	appender.Commit()
-	wr.mu.Unlock()
-	return nil
-}
-
-func (wr *writer) remoteWrite(sNodeMap seriesNodeMap) error {
-	var wg sync.WaitGroup
-	var wgErrChan = make(chan error, len(wr.clstr.Nodes()))
-	for node, nodeSeries := range sNodeMap {
-		if len(nodeSeries) == 0 {
-			continue
-		}
-
-		wg.Add(1)
-		go func(n cluster.Node, nSeries seriesMap) {
-			defer wg.Done()
-
-			wr.log.Debugf("Writing %d series to %s", len(nSeries), n.Name())
-
-			httpAddr, err := n.HTTPAddr()
-			if err != nil {
-				wgErrChan <- err
-				return
-			}
-			apiURL := fmt.Sprintf("%s%s%s", "http://", httpAddr, Route)
-
-			req := &prompb.WriteRequest{
-				Timeseries: make([]*prompb.TimeSeries, 0, len(nSeries)),
-			}
-			for _, ts := range nSeries {
-				req.Timeseries = append(req.Timeseries, ts)
-			}
-
-			data, err := req.Marshal()
-			if err != nil {
-				wgErrChan <- err
-				return
-			}
-
-			compressed := snappy.Encode(nil, data)
-			nodeReq, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(compressed))
-			if err != nil {
-				wgErrChan <- err
-				return
-			}
-			nodeReq.Header.Add("Content-Encoding", "snappy")
-			nodeReq.Header.Set("Content-Type", "application/x-protobuf")
-			nodeReq.Header.Set(httpHeaderRemoteWrite, httpHeaderRemoteWriteVersion)
-			nodeReq.Header.Set(HTTPHeaderInternalWrite, HTTPHeaderInternalWriteVersion)
-
-			// FIXME set timeout using context
-			httpResp, err := ctxhttp.Do(context.TODO(), http.DefaultClient, nodeReq)
-			if err != nil {
-				wgErrChan <- err
-				return
-			}
-
-			io.Copy(ioutil.Discard, httpResp.Body)
-			httpResp.Body.Close()
-
-			if httpResp.StatusCode != http.StatusOK {
-				wgErrChan <- fmt.Errorf("got HTTP %d status code", httpResp.StatusCode)
-				return
-			}
-		}(node, nodeSeries)
-	}
-	// FIXME cancel requests if one fails
-	wg.Wait()
-
-	select {
-	case err := <-wgErrChan:
-		return err
-	default:
-	}
-
-	return nil
 }
 
 type seriesNodeMap map[cluster.Node]seriesMap
