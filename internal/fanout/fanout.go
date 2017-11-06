@@ -76,27 +76,28 @@ func (f *fanoutStorage) Querier(ctx context.Context, mint int64, maxt int64) (st
 }
 
 func (f *fanoutStorage) Appender() (storage.Appender, error) {
-	var (
-		clients   = f.remoteClients()
-		appenders []storage.Appender
-	)
+	clients, err := f.remoteClients()
+	if err != nil {
+		return nil, err
+	}
 
 	localAppender, err := f.localStore.Appender()
 	if err != nil {
 		return nil, err
 	}
 
+	var appenders []storage.Appender
 	appenders = append(appenders, localAppender)
 
 	for _, c := range clients {
-		appenders = append(appenders, &fanoutAppender{
-			ctx:     ctx,
+		appenders = append(appenders, &mergeAppender{
+			//ctx:     ctx, FIXME
 			client:  c,
 			storage: f,
 		})
 	}
 
-	return storage.NewMergeAppender(appenders), nil
+	return newMergeAppender(appenders), nil
 }
 
 func (f *fanoutStorage) StartTime() (int64, error) {
@@ -170,16 +171,62 @@ func (_ fanoutQuerier) Close() error {
 	return nil
 }
 
-type fanoutAppender struct {
+func newMergeAppender(c context.Context, cl *remoteClient, s *fanoutStorage, ts []*prompb.TimeSeries) *mergeAppender {
+	// FIXME handle change in cluster size
+	seriesToNodes := make(seriesNodeMap, len(wr.clstr.Nodes()))
+	for _, n := range wr.clstr.Nodes() {
+		seriesToNodes[*n] = make(seriesMap, numPreallocTimeseries)
+	}
+
+	pSalt := []byte(r.Header.Get(HTTPHeaderPartitionKeySalt))
+	for _, ts := range req.Timeseries {
+		m := make(labels.Labels, 0, len(ts.Labels))
+		for _, l := range ts.Labels {
+			m = append(m, labels.Label{
+				Name:  l.Name,
+				Value: l.Value,
+			})
+		}
+		sort.Stable(m)
+		// FIXME: Handle collisions
+		mHash := m.Hash()
+
+		for _, s := range ts.Samples {
+			timestamp := time.Unix(s.Timestamp/1000, (s.Timestamp-s.Timestamp/1000)*1e6)
+			// FIXME: Avoid panic if the cluster is not yet initialised
+			pKey := cluster.PartitionKey(pSalt, timestamp, mHash)
+			for _, n := range wr.clstr.NodesByPartitionKey(pKey) {
+				if _, ok := seriesToNodes[*n][mHash]; !ok {
+					// FIXME handle change in cluster size
+					seriesToNodes[*n][mHash] = &prompb.TimeSeries{
+						Labels:  ts.Labels,
+						Samples: make([]*prompb.Sample, 0, len(ts.Samples)),
+					}
+				}
+				seriesToNodes[*n][mHash].Samples = append(seriesToNodes[*n][mHash].Samples, s)
+			}
+		}
+		// FIXME: sort samples by time?
+	}
+
+	return &mergeAppender{
+		ctx:     c,
+		client:  cl,
+		storage: s,
+		series:  ts,
+	}
+}
+
+type mergeAppender struct {
 	sync.Mutex
 
 	ctx     context.Context
 	client  *remoteClient
 	storage *fanoutStorage
-	ts      []*prompb.TimeSeries
+	series  []*prompb.TimeSeries
 }
 
-func (a *fanoutAppender) Add(l labels.Labels, t int64, v float64) (uint64, error) {
+func (a *mergeAppender) Add(l labels.Labels, t int64, v float64) (uint64, error) {
 	a.Lock()
 	defer a.Unlock()
 
@@ -191,14 +238,14 @@ func (a *fanoutAppender) Add(l labels.Labels, t int64, v float64) (uint64, error
 	return ref, nil
 }
 
-func (a *fanoutAppender) AddFast(l labels.Labels, ref uint64, t int64, v float64) error {
+func (a *mergeAppender) AddFast(l labels.Labels, ref uint64, t int64, v float64) error {
 	a.Lock()
 	defer a.Unlock()
 
 	panic("not implemented")
 }
 
-func (a *fanoutAppender) Commit() error {
+func (a *mergeAppender) Commit() error {
 	a.Lock()
 	defer a.Unlock()
 
@@ -206,7 +253,7 @@ func (a *fanoutAppender) Commit() error {
 	panic("not implemented")
 }
 
-func (a *fanoutAppender) Rollback() error {
+func (a *mergeAppender) Rollback() error {
 	a.Lock()
 	defer a.Unlock()
 
@@ -438,3 +485,6 @@ func toLabelMatchers(matchers []*labels.Matcher) ([]*prompb.LabelMatcher, error)
 	}
 	return result, nil
 }
+
+type seriesNodeMap map[cluster.Node]seriesMap
+type seriesMap map[uint64]*prompb.TimeSeries
