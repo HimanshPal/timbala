@@ -22,6 +22,7 @@ const (
 	HTTPHeaderRemoteWrite          = "X-Prometheus-Remote-Write-Version"
 	HTTPHeaderRemoteWriteVersion   = "0.1.0"
 	Route                          = "/write"
+	SaltLabelName                  = "__salt__"
 
 	numPreallocTimeseries = 1e5
 )
@@ -91,8 +92,15 @@ func (wr *writer) HandlerFunc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pSalt := r.Header.Get(HTTPHeaderPartitionKeySalt)
+	saltLabel := labels.Label{
+		Name:  SaltLabelName,
+		Value: pSalt,
+	}
+
 	for _, sseries := range req.Timeseries {
 		m := make(labels.Labels, 0, len(sseries.Labels))
+		m = append(m, saltLabel)
 		for _, l := range sseries.Labels {
 			m = append(m, labels.Label{
 				Name:  l.Name,

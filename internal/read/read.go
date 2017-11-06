@@ -98,6 +98,7 @@ func (re *reader) HandlerFunc(w http.ResponseWriter, r *http.Request) {
 
 		sset := querier.Select(matchers...)
 		resp.Results[i], err = ToQueryResult(sset)
+		// FIXME: handle salt label
 		if err != nil {
 			re.log.Warning(err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
